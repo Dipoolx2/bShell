@@ -1,0 +1,4 @@
+/home/sgroote/osc/project1/build/CMakeFiles/shelllib.dir
+/home/sgroote/osc/project1/build/CMakeFiles/shell.dir
+/home/sgroote/osc/project1/build/CMakeFiles/edit_cache.dir
+/home/sgroote/osc/project1/build/CMakeFiles/rebuild_cache.dir

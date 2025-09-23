@@ -1,0 +1,12 @@
+[
+{
+  "directory": "/home/sgroote/osc/project1/build",
+  "command": "/usr/bin/g++  -Wall -g -o CMakeFiles/shelllib.dir/shell.cpp.o -c /home/sgroote/osc/project1/shell.cpp",
+  "file": "/home/sgroote/osc/project1/shell.cpp"
+},
+{
+  "directory": "/home/sgroote/osc/project1/build",
+  "command": "/usr/bin/g++  -Wall -g -o CMakeFiles/shell.dir/main.cpp.o -c /home/sgroote/osc/project1/main.cpp",
+  "file": "/home/sgroote/osc/project1/main.cpp"
+}
+]
