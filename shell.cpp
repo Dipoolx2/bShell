@@ -10,6 +10,7 @@
 */
 
 // function/class definitions you are going to use
+#include <cstdio>
 #include <iostream>
 #include <unistd.h>
 #include <sys/wait.h>
@@ -122,7 +123,11 @@ Expression parse_command_line(string commandLine) {
   vector<string> commands = split_string(commandLine, '|');
   for (size_t i = 0; i < commands.size(); ++i) {
     string& line = commands[i];
+
+    // ------------ TODO: Change this line s.t. quotations are picked up properly.
     vector<string> args = split_string(line, ' ');
+    // ------------
+
     if (i == commands.size() - 1 && args.size() > 1 && args[args.size()-1] == "&") {
       expression.background = true;
       args.resize(args.size()-1);
@@ -151,6 +156,7 @@ int handle_internal_commands(Expression& expression) {
     exit(0);
 
     // Something went wrong: forward error code
+    perror("exit");
     return errno;
   }
 
@@ -158,16 +164,17 @@ int handle_internal_commands(Expression& expression) {
   if (cmdParts.size() == 2 && cmdParts[0] == "cd") {
     int sc = chdir(cmdParts[1].c_str());
 
-    if (sc != 0) 
+    if (sc != 0) {
+      perror("cd");
       return errno; // Something went wrong.
+    }
   }
 
   return -1;
 }
 
-void execute_commands(vector<Command>& commands, vector<int>& exit_statuses) {  
+void execute_commands(vector<Command>& commands) {  
   const int n_commands = commands.size();
-  exit_statuses.resize(n_commands); // Every command has a return code.
   vector<pid_t> pids;
 
   // Write end for process i is at pipe i
@@ -178,8 +185,10 @@ void execute_commands(vector<Command>& commands, vector<int>& exit_statuses) {
   for (int i = 0; i < n_commands - 1; i++) {
     auto p = pipes[i].data();
     if ( pipe(p) == -1 ) { // Test for pipe creation errors
-      perror("Error creating pipe for commands.");
-      exit(1);
+      perror("pipe");
+
+      // Propagate error message to execute_commands caller (don't kill the whole shell).
+      return;
     }
   }
 
@@ -187,8 +196,10 @@ void execute_commands(vector<Command>& commands, vector<int>& exit_statuses) {
   for (int i = 0; i < n_commands; i++) {
     pid_t pid = fork();
     if (pid == -1) { // Test for forking errors
-      perror("Error forking into subprocess for command.");
-      exit(1);
+      perror("fork");
+
+      // Again, don't kill the whole shell if something goes wrong with this.
+      return;
     }
 
     if (pid == 0) { // Child process
@@ -196,7 +207,7 @@ void execute_commands(vector<Command>& commands, vector<int>& exit_statuses) {
       if (i > 0) {
         int ret = dup2( pipes.at( i - 1 ).at(0), STDIN_FILENO );
         if (ret == -1) {
-          perror("Redirecting pipe to stdin failed.");
+          perror("dup2");
           exit(errno);
         }
       }
@@ -205,7 +216,7 @@ void execute_commands(vector<Command>& commands, vector<int>& exit_statuses) {
       if (i < n_commands - 1) {
         int ret = dup2( pipes.at(i).at(1), STDOUT_FILENO );
         if (ret == -1) {
-          perror("Redirecting stdout to pipe failed.");
+          perror("dup2");
           exit(errno);
         }
       }
@@ -221,6 +232,8 @@ void execute_commands(vector<Command>& commands, vector<int>& exit_statuses) {
       execvp( commands.at(i).parts );
 
       // If this point has been reached, something went wrong.
+      string error_msg = "`" + commands.at(i).parts.at(0) + "`";
+      perror(error_msg.c_str());
       exit(errno);
     }
 
@@ -234,49 +247,35 @@ void execute_commands(vector<Command>& commands, vector<int>& exit_statuses) {
     close(p.at(1));
   }
 
-  bool waitfail = false;
-
   // Parent process blocks and waits for all children to finish.
   for (int i = 0; i < n_commands; i++) {
-    // Learned from this post: 
-    // - https://stackoverflow.com/a/39269908
-    // that to find the exit code from a signal number, it is convention to add 128 to the signal code and use the result.
-
     int status;
     if ( waitpid( pids.at(i), &status, 0 ) == -1) {
       // waitpid failed
-      perror("Waiting for process failed during command execution.");
-      waitfail = true;
-    }
+      perror("waitpid");
 
-    if ( WIFEXITED( status ) ) { // Normal exit
-      int es = WEXITSTATUS( status );
-      exit_statuses.at(i) = es;
+      // TODO: Test for exit codes of child processes and possibly print errors accordingly.
     }
-
-    else if ( WIFSIGNALED(status) ) { // Exited by signal
-      int signal_nr = WTERMSIG(status);
-      exit_statuses.at(i) = signal_nr + 128; // Signal nr plus 128 as convention for exit status.
-    }
-  }
-
-  // Exit if waiting for a subprocess failed.
-  if (waitfail) {
-    exit(1);
   }
 
 }
 
-void execute_expression(Expression& expression, vector<int>& exit_statuses) {
+void execute_expression(Expression& expression) {
   // Check for empty expression
-  if (expression.commands.size() == 0) { exit_statuses.push_back( EINVAL ); return; }
+  if (expression.commands.size() == 0) {
+    cerr << EINVAL << endl;
+    return; 
+  }
   
   // Handle intern commands (like 'cd' and 'exit')
   int internal_commands_rc = handle_internal_commands(expression);
-  if (internal_commands_rc != -1) { exit_statuses.push_back(internal_commands_rc); return; }
+  if (internal_commands_rc != -1) { // -1 = handle_internal_commands didn't execute a command.
+    // Something happened, but all errors/results are already printed.
+    return; 
+  }
 
   // Execute commands.
-  execute_commands(expression.commands, exit_statuses);
+  execute_commands(expression.commands);
 }
 
 int shell(bool showPrompt) {
@@ -284,13 +283,7 @@ int shell(bool showPrompt) {
     string commandLine = request_command_line(showPrompt);
     Expression expression = parse_command_line(commandLine);
 
-    vector<int> exit_statuses;
-    execute_expression(expression, exit_statuses);
-
-    for (int es : exit_statuses) {
-      if (es != 0)
-        cerr << strerror(es) << endl;
-    }
+    execute_expression(expression);
   }
   return 0;
 }
