@@ -5,15 +5,9 @@
 	* v22.09.05
 
 	Student names:
-	- ...
-	- ...
+	- Siert Groote
+	- Peter Wardle
 */
-
-/**
- * Hint: in most IDEs (Visual Studio Code, Qt Creator, neovim) you can:
- * - Control-click on a function name to go to the definition
- * - Ctrl-space to auto complete functions and variables
- */
 
 // function/class definitions you are going to use
 #include <iostream>
@@ -32,6 +26,7 @@
 #include <fcntl.h>
 
 #include <vector>
+#include <array>
 #include <list>
 #include <optional>
 
@@ -170,67 +165,132 @@ int handle_internal_commands(Expression& expression) {
   return -1;
 }
 
-int execute_expression(Expression& expression) {
+void execute_commands(vector<Command>& commands, vector<int>& exit_statuses) {  
+  const int n_commands = commands.size();
+  exit_statuses.resize(n_commands); // Every command has a return code.
+  vector<pid_t> pids;
+
+  // Write end for process i is at pipe i
+  // Read end for process i is at pipe i - 1
+  vector<array<int, 2>> pipes(n_commands - 1);
+
+  // Initialize all pipes (before creating subprocesses)
+  for (int i = 0; i < n_commands - 1; i++) {
+    auto p = pipes[i].data();
+    if ( pipe(p) == -1 ) { // Test for pipe creation errors
+      perror("Error creating pipe for commands.");
+      exit(1);
+    }
+  }
+
+  // Start executing commands.
+  for (int i = 0; i < n_commands; i++) {
+    pid_t pid = fork();
+    if (pid == -1) { // Test for forking errors
+      perror("Error forking into subprocess for command.");
+      exit(1);
+    }
+
+    if (pid == 0) { // Child process
+      // Check if it's the first command: Don't redirect input from a pipe for this one's stdin.
+      if (i > 0) {
+        int ret = dup2( pipes.at( i - 1 ).at(0), STDIN_FILENO );
+        if (ret == -1) {
+          perror("Redirecting pipe to stdin failed.");
+          exit(errno);
+        }
+      }
+
+      // Check if it's the last command: Don't redirect output to a pipe for this one's stdout.
+      if (i < n_commands - 1) {
+        int ret = dup2( pipes.at(i).at(1), STDOUT_FILENO );
+        if (ret == -1) {
+          perror("Redirecting stdout to pipe failed.");
+          exit(errno);
+        }
+      }
+
+      // All leftover pipe file descriptors can be closed in the child, as the pipe's 
+      // entry/exit points are now redirected standard input/output.
+      for (array<int, 2> p : pipes) {
+        close(p.at(0));
+        close(p.at(1));
+      }
+
+      // Finally execute the command.
+      execvp( commands.at(i).parts );
+
+      // If this point has been reached, something went wrong.
+      exit(errno);
+    }
+
+    // Parent saves pid so we know which processes to wait for later on.
+    pids.push_back(pid);
+  }
+
+  // The parent still has the pipes open. It does not need them, so they should be closed.
+  for (array<int, 2>& p : pipes) {
+    close(p.at(0));
+    close(p.at(1));
+  }
+
+  bool waitfail = false;
+
+  // Parent process blocks and waits for all children to finish.
+  for (int i = 0; i < n_commands; i++) {
+    // Learned from this post: 
+    // - https://stackoverflow.com/a/39269908
+    // that to find the exit code from a signal number, it is convention to add 128 to the signal code and use the result.
+
+    int status;
+    if ( waitpid( pids.at(i), &status, 0 ) == -1) {
+      // waitpid failed
+      perror("Waiting for process failed during command execution.");
+      waitfail = true;
+    }
+
+    if ( WIFEXITED( status ) ) { // Normal exit
+      int es = WEXITSTATUS( status );
+      exit_statuses.at(i) = es;
+    }
+
+    else if ( WIFSIGNALED(status) ) { // Exited by signal
+      int signal_nr = WTERMSIG(status);
+      exit_statuses.at(i) = signal_nr + 128; // Signal nr plus 128 as convention for exit status.
+    }
+  }
+
+  // Exit if waiting for a subprocess failed.
+  if (waitfail) {
+    exit(1);
+  }
+
+}
+
+void execute_expression(Expression& expression, vector<int>& exit_statuses) {
   // Check for empty expression
-  if (expression.commands.size() == 0)
-    return EINVAL;
+  if (expression.commands.size() == 0) { exit_statuses.push_back( EINVAL ); return; }
   
   // Handle intern commands (like 'cd' and 'exit')
   int internal_commands_rc = handle_internal_commands(expression);
-  if (internal_commands_rc != -1) return internal_commands_rc;
-  
-  // External commands, executed with fork():
-  // Loop over all commandos, and connect the output and input of the forked processes
+  if (internal_commands_rc != -1) { exit_statuses.push_back(internal_commands_rc); return; }
 
-  // For now, we just execute the first command in the expression. Disable.
-  execute_command(expression.commands[0]);
-
-  return 0;
-}
-
-// framework for executing "date | tail -c 5" using raw commands
-// two processes are created, and connected to each other
-int step1(bool showPrompt) {
-  // create communication channel shared between the two processes
-  // ...
-
-  pid_t child1 = fork();
-  if (child1 == 0) {
-    // redirect standard output (STDOUT_FILENO) to the input of the shared communication channel
-    // free non used resources (why?)
-    Command cmd = {{string("date")}};
-    execute_command(cmd);
-    // display nice warning that the executable could not be found
-    abort(); // if the executable is not found, we should abort. (why?)
-  }
-
-  pid_t child2 = fork();
-  if (child2 == 0) {
-    // redirect the output of the shared communication channel to the standard input (STDIN_FILENO).
-    // free non used resources (why?)
-    Command cmd = {{string("tail"), string("-c"), string("5")}};
-    execute_command(cmd);
-    abort(); // if the executable is not found, we should abort. (why?)
-  }
-
-  // free non used resources (why?)
-  // wait on child processes to finish (why both?)
-  waitpid(child1, nullptr, 0);
-  waitpid(child2, nullptr, 0);
-  return 0;
+  // Execute commands.
+  execute_commands(expression.commands, exit_statuses);
 }
 
 int shell(bool showPrompt) {
-  //* <- remove one '/' in front of the other '/' to switch from the normal code to step1 code
   while (cin.good()) {
     string commandLine = request_command_line(showPrompt);
     Expression expression = parse_command_line(commandLine);
-    int rc = execute_expression(expression);
-    if (rc != 0)
-      cerr << strerror(rc) << endl;
+
+    vector<int> exit_statuses;
+    execute_expression(expression, exit_statuses);
+
+    for (int es : exit_statuses) {
+      if (es != 0)
+        cerr << strerror(es) << endl;
+    }
   }
   return 0;
-  /*/
-  return step1(showPrompt);
-  //*/
 }
