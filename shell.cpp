@@ -211,6 +211,7 @@ Expression parse_command_line(string commandLine, bool& success) {
   // Split according to quotes.
   bool balanced_quotes = true; // Separate variable used in case other parse failures are added in the future.
   vector<string> commands = split_respecting_quotes( commandLine, '|', balanced_quotes, true );
+  
   // Check if there are any empty strings: If this is the case remove them from commands.
   bool incorrect_pipe_usage = process_commands( commands );
 
@@ -246,6 +247,11 @@ Expression parse_command_line(string commandLine, bool& success) {
   }
 
   return expression;
+}
+
+// Assumes the leading spaces/tabs are stripped. Checks whether the string starts with `cd` or `exit`.
+bool is_internal_command(string& string) {
+  return string.substr(0,2) == "cd" || string.substr(0, 4) == "exit";
 }
 
 // Return -1 if no commands were triggered. Otherwise return status code.
@@ -381,6 +387,7 @@ void execute_commands(
 
   // Create a new subprocess for each command.
   for (int i = 0; i < n_commands; i++) {
+
     // Do this through fork(). So n_commands different child forks from the
     // parent process are made.
     pid_t pid = fork();
@@ -422,6 +429,12 @@ void execute_commands(
       // Child does not need original pipes anymore, as they are now all
       // redirected to standard input/output with dup2 syscalls.
       close_all_pipes(pipes);
+
+      // Don't execute chained commands with ones such as `cd` or `exit`.
+      bool invalid_command = is_internal_command(commands[i].parts[0]) && n_commands > 1;
+      if (invalid_command) {
+        exit(0);
+      }
 
       // Execute the command.
       execute_command(commands[i]);
