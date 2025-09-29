@@ -19,6 +19,7 @@
 #include <errno.h>
 #include <sys/param.h>
 #include <signal.h>
+#include <fcntl.h>
 #include <string.h>
 #include <assert.h>
 
@@ -46,7 +47,7 @@ struct Expression {
 };
 
 // Parses a string to form a vector of arguments. The separator is a space char (' ').
-vector<string> split_string(const string& str, char delimiter = ' ') {
+vector<string> split_string(const string& str, char delimiter = ' ', bool keep_empty = false) {
   vector<string> retval;
   for (size_t pos = 0; pos < str.length(); ) {
     // look for the next space
@@ -114,19 +115,90 @@ string request_command_line(bool showPrompt) {
   return retval;
 }
 
+bool empty_or_whitespace(string str) {
+  return str.find_first_not_of(' ') == std::string::npos;
+}
+
+// Split a string by a delimiter, respecting quotes.
+// success = false iff there is an odd number of one of the quote types.
+// Keep empty signals whether any empty splits should be recorded. 
+vector<string> split_respecting_quotes(const string& line, const char delimiter, bool& success, bool keep_empty = false) {
+  vector<string> parts;
+  string current;
+  bool in_single = false, in_double = false;
+
+  for (char c : line) {
+    if (c == '\'' && !in_double) {
+      in_single = !in_single; // toggle, don't add quote to charlist.
+    }
+    else if (c == '"' && !in_single) {
+      in_double = !in_double; // toggle, don't add quote to charlist.
+    }
+    else if (!in_single && !in_double) { // Not in quote
+      if (isspace(c) && delimiter == ' ') {
+        // Special case: splitting on spaces
+        if (keep_empty || !empty_or_whitespace(current)) {
+          parts.push_back( current );
+        }
+        current.clear();
+      }
+      else if (c == delimiter) {
+        // Not in quote
+        if (keep_empty || !empty_or_whitespace(current)) {
+          parts.push_back( current );
+        }
+        current.clear();
+      } else {
+        current.push_back( c );
+      }
+    }
+    else { // In quote: Just add the character.
+      current.push_back( c );
+    }
+  }
+
+  // Open quote: this is a syntax error.
+  // Only set to false since it's true by default, and other sources may edit it.
+  if (in_single || in_double)
+    success = false;
+
+  // Only if the string doesn't have characters and keep empty is on, save to the vector.
+  if (keep_empty || !empty_or_whitespace(current))
+    parts.push_back( current );
+
+  return parts;
+}
+
+// Checks whether the command splitting process went ok. If there is an empty command,
+// An input such as `echo "Hello World" | | wc -c` or `| echo "..."` could have happened.
+bool check_command_split(vector<string>& commands) {
+  for (string& cmd : commands) {
+    // cout << "checking command split for `" << cmd << "`" << endl;
+
+    // Check if command has something other than whitespace.
+    if (cmd.find_first_not_of(' ') == string::npos) return false;
+  }
+  return true;
+}
+
 // note: For such a simple shell, there is little need for a full-blown parser (as in an LL or LR capable parser).
 // Here, the user input can be parsed using the following approach.
 // First, divide the input into the distinct commands (as they can be chained, separated by `|`).
 // Next, these commands are parsed separately. The first command is checked for the `<` operator, and the last command for the `>` operator.
-Expression parse_command_line(string commandLine) {
+Expression parse_command_line(string commandLine, bool& success) {
   Expression expression;
-  vector<string> commands = split_string(commandLine, '|');
+
+  // Split according to quotes.
+  bool balanced_quotes = true; // Separate variable used in case other parse failures are added in the future.
+  vector<string> commands = split_respecting_quotes( commandLine, '|', balanced_quotes, true );
+  bool correct_commands = check_command_split( commands );
+
+
   for (size_t i = 0; i < commands.size(); ++i) {
     string& line = commands[i];
 
-    // ------------ TODO: Change this line s.t. quotations are picked up properly.
-    vector<string> args = split_string(line, ' ');
-    // ------------
+    // Same as splitting on '|', keep quotes in mind.
+    vector<string> args = split_respecting_quotes( line, ' ', balanced_quotes );
 
     if (i == commands.size() - 1 && args.size() > 1 && args[args.size()-1] == "&") {
       expression.background = true;
@@ -142,6 +214,17 @@ Expression parse_command_line(string commandLine) {
     }
     expression.commands.push_back({args});
   }
+
+  if (!balanced_quotes) {
+    cerr << "Unbalanced quotes in one or more commands." << endl;
+    success = false;
+  }
+
+  if (!correct_commands) {
+    cerr << "Incorrect usage of `|`." << endl;
+    success = false;
+  }
+
   return expression;
 }
 
@@ -173,13 +256,15 @@ int handle_internal_commands(Expression& expression) {
   return -1;
 }
 
-void execute_commands(vector<Command>& commands) {  
+void execute_commands(vector<Command>& commands, string& file_in, string& file_out) {
   const int n_commands = commands.size();
   vector<pid_t> pids;
 
   // Write end for process i is at pipe i
   // Read end for process i is at pipe i - 1
   vector<array<int, 2>> pipes(n_commands - 1);
+  int infile_fd = -2; // -2 because -1 is reserved for errors whilst opening.
+  int outfile_fd = -2; // See point above.
 
   // Initialize all pipes (before creating subprocesses)
   for (int i = 0; i < n_commands - 1; i++) {
@@ -203,6 +288,32 @@ void execute_commands(vector<Command>& commands) {
     }
 
     if (pid == 0) { // Child process
+
+      if (i == 0 && !empty_or_whitespace(file_in)) {
+        if ((infile_fd = open(file_in.c_str(), O_RDONLY)) == -1) {
+          perror("open");
+          exit(errno);
+        }
+
+        if (dup2( infile_fd, STDIN_FILENO ) == -1) {
+          perror("dup2");
+          exit(errno);
+        }
+      }
+
+      if (i == n_commands - 1 && !empty_or_whitespace(file_out)) {
+        // 0644 permission integer seems to be the standard for writing and creating as found on the internet.
+        if ((outfile_fd = open( file_out.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644 )) == -1) {
+          perror("open");
+          exit(errno);
+        }
+
+        if (dup2( outfile_fd, STDOUT_FILENO ) == -1) {
+          perror("dup2");
+          exit(errno);
+        }
+      }
+
       // Check if it's the first command: Don't redirect input from a pipe for this one's stdin.
       if (i > 0) {
         int ret = dup2( pipes.at( i - 1 ).at(0), STDIN_FILENO );
@@ -258,12 +369,17 @@ void execute_commands(vector<Command>& commands) {
     }
   }
 
+  if (infile_fd != -2)
+    close(infile_fd);
+  if (outfile_fd != -2)
+    close(outfile_fd);
+
 }
 
 void execute_expression(Expression& expression) {
   // Check for empty expression
   if (expression.commands.size() == 0) {
-    cerr << EINVAL << endl;
+    cerr << strerror(EINVAL) << endl;
     return; 
   }
   
@@ -275,13 +391,16 @@ void execute_expression(Expression& expression) {
   }
 
   // Execute commands.
-  execute_commands(expression.commands);
+  execute_commands(expression.commands, expression.inputFromFile, expression.outputToFile);
 }
 
 int shell(bool showPrompt) {
   while (cin.good()) {
     string commandLine = request_command_line(showPrompt);
-    Expression expression = parse_command_line(commandLine);
+
+    bool parse_success = true;
+    Expression expression = parse_command_line(commandLine, parse_success);
+    if (!parse_success) continue;
 
     execute_expression(expression);
   }
