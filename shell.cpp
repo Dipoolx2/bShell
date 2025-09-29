@@ -11,6 +11,7 @@
 
 // function/class definitions you are going to use
 #include <cstdio>
+#include <cstdlib>
 #include <iostream>
 #include <unistd.h>
 #include <sys/wait.h>
@@ -169,16 +170,35 @@ vector<string> split_respecting_quotes(const string& line, const char delimiter,
   return parts;
 }
 
-// Checks whether the command splitting process went ok. If there is an empty command,
-// An input such as `echo "Hello World" | | wc -c` or `| echo "..."` could have happened.
-bool check_command_split(vector<string>& commands) {
-  for (string& cmd : commands) {
+// Trims the given string of any leading or trailing whitespaces.
+std::string trim(const string &s) {
+    size_t start = s.find_first_not_of(" \t");
+    size_t end = s.find_last_not_of(" \t");
+    return start == string::npos ? "" : s.substr(start, end - start + 1);
+}
+
+// Checks whether there are any empty (or whtespace) elements. If there are any,
+// returns true. Strips any nonempty arguments of leading or trailing whitespaces.
+bool process_commands(vector<string>& commands) {
+  bool exists_empty = false;
+  int n_commands = commands.size();
+
+  for (auto it = commands.begin(); it != commands.end();) {
     // cout << "checking command split for `" << cmd << "`" << endl;
 
-    // Check if command has something other than whitespace.
-    if (cmd.find_first_not_of(' ') == string::npos) return false;
+    string cmd = *it;
+    *it = trim(cmd); // Trim the command of any whitespaces.
+
+    // Check if command is empty
+    if (it->find_first_not_of(" \t") == string::npos) {
+      it = commands.erase(it);
+      exists_empty = true;
+    } else {
+      it++; // No removal necessary.
+    }
   }
-  return true;
+
+  return exists_empty && n_commands > 1;
 }
 
 // note: For such a simple shell, there is little need for a full-blown parser (as in an LL or LR capable parser).
@@ -191,8 +211,8 @@ Expression parse_command_line(string commandLine, bool& success) {
   // Split according to quotes.
   bool balanced_quotes = true; // Separate variable used in case other parse failures are added in the future.
   vector<string> commands = split_respecting_quotes( commandLine, '|', balanced_quotes, true );
-  bool correct_commands = check_command_split( commands );
-
+  // Check if there are any empty strings: If this is the case remove them from commands.
+  bool incorrect_pipe_usage = process_commands( commands );
 
   for (size_t i = 0; i < commands.size(); ++i) {
     string& line = commands[i];
@@ -216,12 +236,12 @@ Expression parse_command_line(string commandLine, bool& success) {
   }
 
   if (!balanced_quotes) {
-    cerr << "Unbalanced quotes in one or more commands." << endl;
+    cerr << "Parse error: Unbalanced quotes in one or more commands." << endl;
     success = false;
   }
 
-  if (!correct_commands) {
-    cerr << "Incorrect usage of `|`." << endl;
+  if (incorrect_pipe_usage) {
+    cerr << "Parse error: Incorrect usage of `|`." << endl;
     success = false;
   }
 
@@ -251,132 +271,224 @@ int handle_internal_commands(Expression& expression) {
       perror("cd");
       return errno; // Something went wrong.
     }
+
+    return sc;
   }
 
   return -1;
 }
 
-void execute_commands(vector<Command>& commands, string& file_in, string& file_out) {
-  const int n_commands = commands.size();
-  vector<pid_t> pids;
 
-  // Write end for process i is at pipe i
-  // Read end for process i is at pipe i - 1
-  vector<array<int, 2>> pipes(n_commands - 1);
-  int infile_fd = -2; // -2 because -1 is reserved for errors whilst opening.
-  int outfile_fd = -2; // See point above.
-
-  // Initialize all pipes (before creating subprocesses)
-  for (int i = 0; i < n_commands - 1; i++) {
-    auto p = pipes[i].data();
-    if ( pipe(p) == -1 ) { // Test for pipe creation errors
-      perror("pipe");
-
-      // Propagate error message to execute_commands caller (don't kill the whole shell).
-      return;
-    }
-  }
-
-  // Start executing commands.
-  for (int i = 0; i < n_commands; i++) {
-    pid_t pid = fork();
-    if (pid == -1) { // Test for forking errors
-      perror("fork");
-
-      // Again, don't kill the whole shell if something goes wrong with this.
-      return;
-    }
-
-    if (pid == 0) { // Child process
-
-      if (i == 0 && !empty_or_whitespace(file_in)) {
-        if ((infile_fd = open(file_in.c_str(), O_RDONLY)) == -1) {
-          perror("open");
-          exit(errno);
-        }
-
-        if (dup2( infile_fd, STDIN_FILENO ) == -1) {
-          perror("dup2");
-          exit(errno);
-        }
-      }
-
-      if (i == n_commands - 1 && !empty_or_whitespace(file_out)) {
-        // 0644 permission integer seems to be the standard for writing and creating as found on the internet.
-        if ((outfile_fd = open( file_out.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644 )) == -1) {
-          perror("open");
-          exit(errno);
-        }
-
-        if (dup2( outfile_fd, STDOUT_FILENO ) == -1) {
-          perror("dup2");
-          exit(errno);
-        }
-      }
-
-      // Check if it's the first command: Don't redirect input from a pipe for this one's stdin.
-      if (i > 0) {
-        int ret = dup2( pipes.at( i - 1 ).at(0), STDIN_FILENO );
-        if (ret == -1) {
-          perror("dup2");
-          exit(errno);
-        }
-      }
-
-      // Check if it's the last command: Don't redirect output to a pipe for this one's stdout.
-      if (i < n_commands - 1) {
-        int ret = dup2( pipes.at(i).at(1), STDOUT_FILENO );
-        if (ret == -1) {
-          perror("dup2");
-          exit(errno);
-        }
-      }
-
-      // All leftover pipe file descriptors can be closed in the child, as the pipe's 
-      // entry/exit points are now redirected standard input/output.
-      for (array<int, 2> p : pipes) {
-        close(p.at(0));
-        close(p.at(1));
-      }
-
-      // Finally execute the command.
-      execvp( commands.at(i).parts );
-
-      // If this point has been reached, something went wrong.
-      string error_msg = "`" + commands.at(i).parts.at(0) + "`";
-      perror(error_msg.c_str());
+// Redirects standard input of the current process to the input file (if not
+// empty or whitespace). Closes standard input if background is set to true.
+void setup_input(const string &file_in, bool background) {
+  if (!empty_or_whitespace(file_in)) {
+    // There is an input file. Redirect standard in to this file.
+    int fd = open(file_in.c_str(), O_RDONLY);
+    if (fd == -1) {
+      perror("open input");
       exit(errno);
     }
 
-    // Parent saves pid so we know which processes to wait for later on.
-    pids.push_back(pid);
+    // Use the dup2 syscall to redirect standard input to the input file.
+    if (dup2(fd, STDIN_FILENO) == -1) {
+      perror("dup2 input");
+      exit(errno);
+    }
+
+    // Afterwards, close the fd for the file itself since it is not needed
+    // anymore.
+    close(fd);
+  } else if (background) {
+    // For background jobs with no input redirection, close stdin (this was a
+    // project requirement)
+    if (close(STDIN_FILENO) == -1) {
+      perror("close stdin");
+      exit(errno);
+    }
   }
+}
 
-  // The parent still has the pipes open. It does not need them, so they should be closed.
-  for (array<int, 2>& p : pipes) {
-    close(p.at(0));
-    close(p.at(1));
+// Redirects standard output of the current process to the output file (if not
+// empty or whitespace).
+void setup_output(const string &file_out) {
+  if (!empty_or_whitespace(file_out)) {
+    // There is an output file: redirect standard output to this file.
+    // O_WRONLY: You need to write, not read.
+    // O_CREAT: Create the file if not present.
+    // O_TRUNC: Overwrite existing files of the same name.
+    // 0644: Seems to be standard permission flag if you want to create and
+    // write to files.
+    int fd = open(file_out.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd == -1) {
+      perror("open output");
+      exit(errno);
+    }
+
+    // Use the dup2 syscall to redirect standard output to the output file.
+    if (dup2(fd, STDOUT_FILENO) == -1) {
+      perror("dup2 output");
+      exit(errno);
+    }
+
+    // Close file's fd since it is not needed anymore.
+    close(fd);
   }
+}
 
-  // Parent process blocks and waits for all children to finish.
-  for (int i = 0; i < n_commands; i++) {
-    int status;
-    if ( waitpid( pids.at(i), &status, 0 ) == -1) {
-      // waitpid failed
-      perror("waitpid");
+// Closes all pipes as given as arguments.
+void close_all_pipes(const vector<array<int, 2>> &pipes) {
+  for (const auto &p : pipes) {
+    // Close both ends.
+    close(p[0]);
+    close(p[1]);
+  }
+}
 
-      // TODO: Test for exit codes of child processes and possibly print errors accordingly.
+void execute_commands(
+    vector<Command> &commands, // Commands as split with pipes
+    vector<pid_t> &bg_pids,    // All pids of subprocesses that are ran in the
+                               // background. Only write to.
+    string &file_in,  // Input file name in case the first command uses an input
+                      // file.
+    string &file_out, // Output file name in case the last command uses an
+                      // output file.
+    bool background   // Whether `&` is used in the command (in this case run
+                      // processes in the background).
+) {
+  int n_commands =
+      commands.size(); // To remove overhead of calling .size() every time.
+  vector<pid_t>
+      pids; // To keep track of which subprocesses to wait for later on.
+
+  if (n_commands == 0) {
+    return;
+  }
+  
+  // Create pipes. Only do so if there is more than one command,
+  // and make one less since pipes are inbetween processes.
+  // The standard output of process i redirected to the write end of pipe i.
+  // The standard input of process i is redirected to the read end of pipe i-1.
+  vector<array<int, 2>> pipes(n_commands > 1 ? n_commands - 1 : 0);
+
+  for (int i = 0; i < n_commands - 1; i++) {
+    // Initialize the pipe to the pipes vector.
+    if (pipe(pipes[i].data()) == -1) {
+      perror("pipe");
+      return;
     }
   }
 
-  if (infile_fd != -2)
-    close(infile_fd);
-  if (outfile_fd != -2)
-    close(outfile_fd);
+  // Create a new subprocess for each command.
+  for (int i = 0; i < n_commands; i++) {
+    // Do this through fork(). So n_commands different child forks from the
+    // parent process are made.
+    pid_t pid = fork();
+    if (pid == -1) {
+      perror("fork");
+      return;
+    }
 
+    if (pid == 0) {
+      // --- Branch of the child process start ---
+
+      // First, setup the inputs and outputs for the first and last command.
+      if (i == 0) {
+        setup_input(file_in, background);
+      }
+      if (i == n_commands - 1) {
+        setup_output(file_out);
+      }
+
+      // Setup pipes' input ends (not for the first command)
+      if (i > 0) {
+        // Use the dup2 syscall for this and redirect pipes (with indexes as
+        // described before).
+        if (dup2(pipes[i - 1][0], STDIN_FILENO) == -1) {
+          perror("dup2 pipe in");
+          exit(errno);
+        }
+      }
+      // Setup pipes' output ends (not for the last command)
+      if (i < n_commands - 1) {
+        // Use the dup2 syscall again for this and redirect pipes (with indexes
+        // as described before).
+        if (dup2(pipes[i][1], STDOUT_FILENO) == -1) {
+          perror("dup2 pipe out");
+          exit(errno);
+        }
+      }
+
+      // Child does not need original pipes anymore, as they are now all
+      // redirected to standard input/output with dup2 syscalls.
+      close_all_pipes(pipes);
+
+      // Execute the command.
+      execute_command(commands[i]);
+
+      // Something went wrong if we're still executing this.
+      std::string msg = "`" + commands[i].parts[0] + "`";
+      perror(msg.c_str());
+
+      exit(errno);
+    }
+
+    // Parent pushes the pid to the pids list to keep track of which pids to
+    // wait for.
+    pids.push_back(pid);
+    if (background) {
+      // If it is a background process, future blocks also need to know what
+      // pids to wait for.
+      bg_pids.push_back(pid);
+    }
+  }
+
+  // Parent closes all pipes since they're not needed here.
+  close_all_pipes(pipes);
+
+  if (background) {
+    // In most shells the job number is printed but we don't have jobs (just stuff in the background) for ths shell.
+    // So we just print [bg] instead.
+    std::cout << "[bg] " << pids.back() << std::endl;
+  } else {
+    // Run in foreground; wait for all processes and block.
+    for (pid_t pid : pids) {
+      int status;
+      if (waitpid(pid, &status, 0) == -1) {
+        perror("waitpid");
+      } else if (WIFSIGNALED(status)) {
+        // Only report errors for processes that were terminated through a
+        // signal. Other processes that were terminated regularly will already
+        // have printed any relevant/necessary error messages.
+
+        int sig_code = WTERMSIG(status) ;
+        std::cerr << strsignal(sig_code) << std::endl;
+      }
+    }
+  }
 }
 
-void execute_expression(Expression& expression) {
+void poll_background_processes(vector<pid_t>& pids) {
+  int status;
+
+  // Use iterator to avoid concurrent modification exceptions.
+  for (auto it = pids.begin(); it != pids.end();) {
+    // Poll whether the process has terminated or not.
+    pid_t result = waitpid(*it, &status, WNOHANG);
+    if (result == -1) {
+      perror("waitpid");
+      it = pids.erase(it);
+    } else if (result > 0) {
+      //  Process has terminated. Print done!
+      std::cout << "[done] " << *it << std::endl;
+      it = pids.erase(it);
+    } else {
+      it++; // process is still busy.
+    }
+  }
+}
+
+void execute_expression(Expression& expression, vector<pid_t>& bg_pids) {
   // Check for empty expression
   if (expression.commands.size() == 0) {
     cerr << strerror(EINVAL) << endl;
@@ -391,18 +503,23 @@ void execute_expression(Expression& expression) {
   }
 
   // Execute commands.
-  execute_commands(expression.commands, expression.inputFromFile, expression.outputToFile);
+  execute_commands(expression.commands, bg_pids, expression.inputFromFile, expression.outputToFile, expression.background);
 }
 
 int shell(bool showPrompt) {
+  vector<pid_t> bg_pids;
+
   while (cin.good()) {
+    // Poll whether any background processes have finished running in the meantime.
+    poll_background_processes(bg_pids);
+
     string commandLine = request_command_line(showPrompt);
 
     bool parse_success = true;
     Expression expression = parse_command_line(commandLine, parse_success);
-    if (!parse_success) continue;
+    if (!parse_success) continue; // Don't execute any bad inputs.
 
-    execute_expression(expression);
+    execute_expression(expression, bg_pids);
   }
   return 0;
 }

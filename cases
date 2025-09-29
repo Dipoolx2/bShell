@@ -1,0 +1,14 @@
+ls -l | grep cpp
+
+sleep 5 | echo done &
+
+wc -l < somefile.txt
+
+echo hello > out.txt
+cat out.txt
+
+grep main < source.cpp > mains.txt
+
+ls -l | grep cpp > files.txt
+
+sleep 10 > out.txt &
