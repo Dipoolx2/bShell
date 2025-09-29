@@ -47,25 +47,6 @@ struct Expression {
   bool background = false;
 };
 
-// Parses a string to form a vector of arguments. The separator is a space char (' ').
-vector<string> split_string(const string& str, char delimiter = ' ', bool keep_empty = false) {
-  vector<string> retval;
-  for (size_t pos = 0; pos < str.length(); ) {
-    // look for the next space
-    size_t found = str.find(delimiter, pos);
-    // if no space was found, this is the last word
-    if (found == string::npos) {
-      retval.push_back(str.substr(pos));
-      break;
-    }
-    // filter out consequetive spaces
-    if (found != pos)
-      retval.push_back(str.substr(pos, found-pos));
-    pos = found+1;
-  }
-  return retval;
-}
-
 // wrapper around the C execvp so it can be called with C++ strings (easier to work with)
 // always start with the command itself
 // DO NOT CHANGE THIS FUNCTION UNDER ANY CIRCUMSTANCE
