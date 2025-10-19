@@ -19,7 +19,6 @@
 #include <stdio.h>
 #include <errno.h>
 #include <sys/param.h>
-#include <signal.h>
 #include <fcntl.h>
 #include <string.h>
 #include <assert.h>
@@ -30,8 +29,6 @@
 
 #include <vector>
 #include <array>
-#include <list>
-#include <optional>
 
 // although it is good habit, you don't have to type 'std' before many objects by including this line
 using namespace std;
